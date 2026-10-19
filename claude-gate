@@ -1,9 +1,10 @@
 #!/opt/homebrew/bin/python3
 """Lock every local Claude client to the Clash exit.
 
-The ladder is 127.0.0.1:7890 (Clash Verge mixed-port). When that port is
-down, or the exit is the home broadband / a CN address, Claude Code and
-Claude.app are not allowed to reach the network.
+The ladder is Clash Verge's mixed-port (read from clash-verge.yaml, usually
+127.0.0.1:7890). When that port is down, or the exit is the home broadband /
+a CN or HK address, Claude Code and Claude.app are not allowed to reach the
+network.
 """
 
 from __future__ import annotations
@@ -26,7 +27,24 @@ PROFILE = CONF / "localhost-only.sb"
 WRAPPER_MARK = "claude-gate-wrapper"
 LINK = HOME / ".local" / "bin" / "claude"
 VERSIONS = HOME / ".local" / "share" / "claude" / "versions"
-PORT = int(os.environ.get("CLAUDE_GATE_PORT", "7890"))
+
+
+def detect_port() -> int:
+    env = os.environ.get("CLAUDE_GATE_PORT")
+    if env:
+        return int(env)
+    path = HOME / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("mixed-port:"):
+                return int(stripped.split(":", 1)[1].strip().strip("'\""))
+    except (OSError, ValueError):
+        pass
+    return 7890
+
+
+PORT = detect_port()
 PROXY = f"http://127.0.0.1:{PORT}"
 TRACE_URLS = (
     "https://1.1.1.1/cdn-cgi/trace",
