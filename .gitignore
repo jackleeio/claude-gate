@@ -2,3 +2,5 @@
 *.log
 home-ip
 state
+__pycache__/
+*.pyc
