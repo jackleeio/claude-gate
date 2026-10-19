@@ -1,0 +1,535 @@
+#!/opt/homebrew/bin/python3
+"""Lock every local Claude client to the Clash exit.
+
+The ladder is 127.0.0.1:7890 (Clash Verge mixed-port). When that port is
+down, or the exit is the home broadband / a CN address, Claude Code and
+Claude.app are not allowed to reach the network.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONF = HOME / ".config" / "claude-gate"
+STATE = CONF / "state"
+HOME_IP_FILE = CONF / "home-ip"
+PROFILE = CONF / "localhost-only.sb"
+WRAPPER_MARK = "claude-gate-wrapper"
+LINK = HOME / ".local" / "bin" / "claude"
+VERSIONS = HOME / ".local" / "share" / "claude" / "versions"
+PORT = int(os.environ.get("CLAUDE_GATE_PORT", "7890"))
+PROXY = f"http://127.0.0.1:{PORT}"
+TRACE_URLS = (
+    "https://1.1.1.1/cdn-cgi/trace",
+    "https://1.0.0.1/cdn-cgi/trace",
+    "https://cloudflare.com/cdn-cgi/trace",
+)
+HOME_URL = "https://myip.ipip.net"
+DENY_LOCS = {"CN": "中国", "HK": "香港"}
+PROXY_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
+MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+}
+PROFILE_TEXT = """(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+"""
+
+
+class Verdict:
+    def __init__(self, ok: bool, severe: bool, reason: str, loc: str = "", exit_ip: str = ""):
+        self.ok = ok
+        self.severe = severe
+        self.reason = reason
+        self.loc = loc
+        self.exit_ip = exit_ip
+
+
+def log(msg: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{stamp} {msg}", flush=True)
+
+
+def clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in PROXY_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def curl(extra: list[str], timeout: int = 8) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/usr/bin/curl", "-4", "-fsS", "--max-time", str(timeout), *extra],
+        env=clean_env(),
+        capture_output=True,
+        text=True,
+    )
+
+
+def port_open() -> bool:
+    sock = socket.socket()
+    sock.settimeout(0.4)
+    try:
+        sock.connect(("127.0.0.1", PORT))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def parse_trace(text: str) -> tuple[str, str]:
+    ip = re.search(r"^ip=(\S+)", text, re.M)
+    loc = re.search(r"^loc=(\S+)", text, re.M)
+    return (ip.group(1) if ip else "", loc.group(1) if loc else "")
+
+
+def fetch_exit() -> tuple[str, str]:
+    for url in TRACE_URLS:
+        proc = curl(["-x", PROXY, url], timeout=8)
+        if proc.returncode == 0 and proc.stdout:
+            ip, loc = parse_trace(proc.stdout)
+            if ip and loc:
+                return ip, loc
+    return "", ""
+
+
+def load_home_ips() -> set[str]:
+    if not HOME_IP_FILE.exists():
+        return set()
+    ips = set()
+    for line in HOME_IP_FILE.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", line):
+            ips.add(line)
+    return ips
+
+
+def remember_home_ip(ip: str) -> None:
+    ips = load_home_ips()
+    if ip in ips:
+        return
+    ips.add(ip)
+    CONF.mkdir(parents=True, exist_ok=True)
+    HOME_IP_FILE.write_text("".join(f"{item}\n" for item in sorted(ips)))
+    os.chmod(HOME_IP_FILE, 0o600)
+
+
+def refresh_home_ip() -> None:
+    age_ok = False
+    if HOME_IP_FILE.exists():
+        age_ok = time.time() - HOME_IP_FILE.stat().st_mtime < 30 * 60
+    if age_ok and load_home_ips():
+        return
+    proc = curl(["--proxy", "", HOME_URL], timeout=5)
+    text = proc.stdout or ""
+    if proc.returncode != 0 or "中国" not in text:
+        return
+    match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", text)
+    if match:
+        remember_home_ip(match.group(1))
+
+
+def evaluate() -> Verdict:
+    if not port_open():
+        return Verdict(False, True, f"127.0.0.1:{PORT} 没在监听，梯子是断的")
+    refresh_home_ip()
+    exit_ip, loc = fetch_exit()
+    if not exit_ip or not loc:
+        return Verdict(False, False, "确认不了国外出口（探测失败），按梯子失效处理")
+    if loc in DENY_LOCS:
+        return Verdict(False, True, f"出口是{DENY_LOCS[loc]}，直接切断", loc, exit_ip)
+    home = load_home_ips()
+    if exit_ip in home:
+        return Verdict(False, True, "出口地址和家里宽带是同一个，流量没有出隧道", loc, exit_ip)
+    return Verdict(True, False, f"出口 {loc}，和家里宽带不是同一个地址", loc, exit_ip)
+
+
+def write_state(verdict: Verdict) -> None:
+    CONF.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(
+        [
+            "open" if verdict.ok else "closed",
+            verdict.reason,
+            verdict.loc,
+            verdict.exit_ip,
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            "",
+        ]
+    )
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(body)
+    os.chmod(tmp, 0o600)
+    tmp.replace(STATE)
+
+
+def print_verdict(verdict: Verdict) -> None:
+    if verdict.ok:
+        print(f"✅ 梯子可用。{verdict.reason}。Claude 可以开。")
+        return
+    print("🚫 已禁止使用 Claude", file=sys.stderr)
+    print(verdict.reason + "。", file=sys.stderr)
+    print("这次没有直连，也没有放行。接上梯子后再开。", file=sys.stderr)
+
+
+def is_macho(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) in MACHO_MAGICS
+    except OSError:
+        return False
+
+
+def find_real() -> Path | None:
+    if not VERSIONS.is_dir():
+        return None
+    found = [p for p in VERSIONS.iterdir() if p.is_file() and os.access(p, os.X_OK) and is_macho(p)]
+    if not found:
+        return None
+    return max(found, key=lambda p: p.stat().st_mtime)
+
+
+def ensure_wrapper() -> bool:
+    """Point ~/.local/bin/claude at the gate. Return True if a repair happened."""
+    text = f"""#!/bin/bash
+# {WRAPPER_MARK}
+exec "$HOME/.local/bin/claude-gate" run -- "$@"
+"""
+    current = ""
+    if LINK.exists() or LINK.is_symlink():
+        if LINK.is_symlink() or not LINK.is_file():
+            current = ""
+        else:
+            try:
+                current = LINK.read_text(errors="replace")
+            except OSError:
+                current = ""
+    if WRAPPER_MARK in current and "claude-gate" in current and " run --" in current:
+        return False
+    LINK.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LINK.with_name("claude.gate-new")
+    tmp.write_text(text)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, LINK)
+    return True
+
+
+def proxy_env() -> dict[str, str]:
+    env = os.environ.copy()
+    socks = f"socks5://127.0.0.1:{PORT}"
+    env.update(
+        {
+            "HTTPS_PROXY": PROXY,
+            "HTTP_PROXY": PROXY,
+            "ALL_PROXY": socks,
+            "https_proxy": PROXY,
+            "http_proxy": PROXY,
+            "all_proxy": socks,
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+            "no_proxy": "localhost,127.0.0.1,::1",
+            "NODE_USE_ENV_PROXY": "1",
+        }
+    )
+    return env
+
+
+def write_profile() -> Path:
+    CONF.mkdir(parents=True, exist_ok=True)
+    if not PROFILE.exists() or PROFILE.read_text() != PROFILE_TEXT:
+        PROFILE.write_text(PROFILE_TEXT)
+    return PROFILE
+
+
+def killpg(pid: int, sig: int = signal.SIGKILL) -> None:
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def cmd_run(user_args: list[str]) -> int:
+    verdict = evaluate()
+    write_state(verdict)
+    if not verdict.ok:
+        print_verdict(verdict)
+        return 75
+    real = find_real()
+    if real is None:
+        print("找不到 Claude 程序（~/.local/share/claude/versions）。", file=sys.stderr)
+        return 1
+    args = list(user_args)
+    if "--dangerously-skip-permissions" not in args:
+        args = ["--dangerously-skip-permissions", *args]
+    profile = write_profile()
+    proc = subprocess.Popen(
+        ["/usr/bin/sandbox-exec", "-f", str(profile), str(real), *args],
+        env=proxy_env(),
+        start_new_session=True,
+    )
+    stop = threading.Event()
+
+    def watch() -> None:
+        soft = 0
+        while not stop.wait(5):
+            if proc.poll() is not None:
+                return
+            current = evaluate()
+            write_state(current)
+            if current.ok:
+                soft = 0
+                continue
+            if not current.severe and soft < 1:
+                soft += 1
+                continue
+            print(f"\n🚫 梯子失效，已终止 Claude。{current.reason}。", file=sys.stderr)
+            killpg(proc.pid)
+            return
+
+    threading.Thread(target=watch, daemon=True).start()
+
+    def forward(signum: int, _frame: object) -> None:
+        killpg(proc.pid, signum)
+
+    signal.signal(signal.SIGINT, forward)
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGHUP, forward)
+    rc = proc.wait()
+    stop.set()
+    return rc if rc >= 0 else 128 + (-rc)
+
+
+def list_processes() -> list[tuple[int, int, str]]:
+    proc = subprocess.run(
+        ["/bin/ps", "-axww", "-o", "pid=,ppid=,command="],
+        capture_output=True,
+        text=True,
+    )
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    return rows
+
+
+def is_claude_exe(command: str) -> bool:
+    if "claude-gate" in command:
+        return False
+    exe = command.split(" ", 1)[0]
+    if exe.startswith("/Applications/Claude.app/"):
+        return True
+    if "/.local/share/claude/versions/" in exe:
+        return True
+    if exe == str(LINK) or exe.endswith("/.local/bin/claude"):
+        return True
+    if exe == "/opt/homebrew/bin/claude":
+        return True
+    return False
+
+
+def claude_pids(rows: list[tuple[int, int, str]] | None = None) -> list[int]:
+    rows = rows if rows is not None else list_processes()
+    by_pid = {pid: (ppid, cmd) for pid, ppid, cmd in rows}
+    roots = {pid for pid, (_ppid, cmd) in by_pid.items() if is_claude_exe(cmd)}
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _cmd) in by_pid.items():
+        children.setdefault(ppid, []).append(pid)
+    chosen = set(roots)
+    stack = list(roots)
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            if child not in chosen:
+                chosen.add(child)
+                stack.append(child)
+    me = os.getpid()
+    return sorted(pid for pid in chosen if pid != me and pid > 1)
+
+
+def enforce_kill() -> list[int]:
+    pids = claude_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return pids
+
+
+def cmd_watch() -> int:
+    CONF.mkdir(parents=True, exist_ok=True)
+    log("claude-gate watch 已启动")
+    state = "unknown"
+    reason = ""
+    soft = 0
+    last_trace = 0.0
+    while True:
+        try:
+            if ensure_wrapper():
+                log("已把 ~/.local/bin/claude 重新接回门禁（更新把包装换掉了）")
+            if not port_open():
+                verdict = Verdict(False, True, f"127.0.0.1:{PORT} 没在监听，梯子是断的")
+                soft = 0
+            elif time.time() - last_trace >= 8 or state != "open":
+                verdict = evaluate()
+                last_trace = time.time()
+            else:
+                verdict = None
+
+            if verdict is not None:
+                if verdict.ok:
+                    soft = 0
+                    if state != "open":
+                        log(f"OPEN {verdict.reason}")
+                    state = "open"
+                    reason = verdict.reason
+                    write_state(verdict)
+                elif verdict.severe or soft >= 1 or state == "closed":
+                    soft = 0
+                    if state != "closed" or verdict.reason != reason:
+                        log(f"CLOSED {verdict.reason}")
+                    state = "closed"
+                    reason = verdict.reason
+                    write_state(verdict)
+                else:
+                    soft += 1
+                    log(f"探测失败 1 次，先不关：{verdict.reason}")
+
+            if state == "closed":
+                killed = enforce_kill()
+                if killed:
+                    log(f"已结束 Claude 进程 {len(killed)} 个")
+        except Exception as exc:
+            log(f"watch 出错，按失效继续盯着：{exc}")
+            state = "closed"
+        time.sleep(2)
+
+
+def cmd_ps() -> int:
+    rows = list_processes()
+    hits = set(claude_pids(rows))
+    for pid, _ppid, cmd in rows:
+        if pid in hits:
+            print(f"{pid} {cmd[:180]}")
+    print(f"# {len(hits)} 个")
+    return 0
+
+
+def self_test() -> int:
+    samples = {
+        "/Applications/Claude.app/Contents/MacOS/Claude": True,
+        "/Applications/Claude.app/Contents/Frameworks/Claude Helper": True,
+        str(VERSIONS / "2.1.303"): True,
+        str(LINK): True,
+        "/opt/homebrew/bin/claude": True,
+        f"/opt/homebrew/bin/python3 {HOME}/.local/bin/claude-gate watch": False,
+        "/opt/homebrew/bin/node /Users/jacklee/Projects/claude-desktop-sync/sync.mjs daemon": False,
+        "/Users/jacklee/Projects/bnbot/node_modules/@openai/codex/vendor/bin/codex": False,
+    }
+    failed = False
+    for command, expect in samples.items():
+        got = is_claude_exe(command)
+        if got != expect:
+            print(f"FAIL match {expect} got {got}: {command}")
+            failed = True
+    open_verdict = evaluate()
+    print(("OPEN " if open_verdict.ok else "CLOSED ") + open_verdict.reason)
+    if not open_verdict.ok:
+        print("FAIL live gate should be open while 7890 is up")
+        failed = True
+    previous = os.environ.get("CLAUDE_GATE_PORT")
+    os.environ["CLAUDE_GATE_PORT"] = "1"
+    # port_open reads PORT captured at import. Re-check with a direct socket.
+    sock = socket.socket()
+    sock.settimeout(0.3)
+    try:
+        sock.connect(("127.0.0.1", 1))
+        port1 = True
+    except OSError:
+        port1 = False
+    finally:
+        sock.close()
+    if previous is None:
+        os.environ.pop("CLAUDE_GATE_PORT", None)
+    else:
+        os.environ["CLAUDE_GATE_PORT"] = previous
+    if port1:
+        print("FAIL port 1 should be closed")
+        failed = True
+    profile = write_profile()
+    denied = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-f", str(profile), "/usr/bin/curl", "-4", "-sS", "-o", "/dev/null", "--max-time", "4", "--proxy", "", "https://1.1.1.1/cdn-cgi/trace"],
+        env=clean_env(),
+    )
+    allowed = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-f", str(profile), "/usr/bin/curl", "-4", "-fsS", "-o", "/dev/null", "--max-time", "12", "-x", PROXY, "https://1.1.1.1/cdn-cgi/trace"],
+        env=clean_env(),
+    )
+    if denied.returncode == 0:
+        print("FAIL sandbox allowed a direct connection")
+        failed = True
+    if allowed.returncode != 0:
+        print(f"FAIL sandbox blocked the proxy path ({allowed.returncode})")
+        failed = True
+    print("sandbox direct", denied.returncode, "proxy", allowed.returncode)
+    if failed:
+        return 1
+    print("self-test ok")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    if cmd in ("check", "status"):
+        verdict = evaluate()
+        write_state(verdict)
+        print_verdict(verdict)
+        return 0 if verdict.ok else 75
+    if cmd == "run":
+        user = args[2:] if len(args) > 1 and args[1] == "--" else args[1:]
+        return cmd_run(user)
+    if cmd == "watch":
+        return cmd_watch()
+    if cmd == "ps":
+        return cmd_ps()
+    if cmd == "self-test":
+        return self_test()
+    if cmd == "install-wrapper":
+        changed = ensure_wrapper()
+        print("wrapper repaired" if changed else "wrapper already in place")
+        return 0
+    print(
+        "用法: claude-gate status | run -- [claude 参数] | watch | ps",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

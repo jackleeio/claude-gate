@@ -1,0 +1,6 @@
+# Direct packets to Anthropic's own network.
+# Clash sends Claude via the proxy node, which is outside these ranges,
+# so a working ladder is unaffected. A direct connection is reset.
+block return out quick inet from any to 160.79.104.0/23
+block return out quick inet6 from any to 2607:6bc0::/48
+block return out quick inet6 from any to 2607:6bc0:11::/48

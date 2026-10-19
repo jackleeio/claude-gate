@@ -1,0 +1,17 @@
+#!/bin/bash
+# Keep the Anthropic direct-path block loaded across reboots and pf flushes.
+ANCHOR_NAME="com.apple/claude-gate"
+ANCHOR_FILE="/etc/pf.anchors/claude-gate"
+
+apply() {
+  /sbin/pfctl -E >/dev/null 2>&1 || true
+  /sbin/pfctl -a "$ANCHOR_NAME" -f "$ANCHOR_FILE"
+}
+
+apply
+while true; do
+  sleep 30
+  if ! /sbin/pfctl -a "$ANCHOR_NAME" -sr 2>/dev/null | /usr/bin/grep -q "160.79.104.0/23"; then
+    apply || true
+  fi
+done

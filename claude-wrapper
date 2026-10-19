@@ -1,0 +1,3 @@
+#!/bin/bash
+# claude-gate-wrapper
+exec "$HOME/.local/bin/claude-gate" run -- "$@"
