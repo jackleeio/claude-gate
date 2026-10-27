@@ -466,8 +466,8 @@ def self_test() -> int:
         str(LINK): True,
         "/opt/homebrew/bin/claude": True,
         f"/opt/homebrew/bin/python3 {HOME}/.local/bin/claude-gate watch": False,
-        "/opt/homebrew/bin/node /Users/jacklee/Projects/claude-desktop-sync/sync.mjs daemon": False,
-        "/Users/jacklee/Projects/bnbot/node_modules/@openai/codex/vendor/bin/codex": False,
+        f"/opt/homebrew/bin/node {HOME}/Projects/app/sync.mjs daemon": False,
+        f"{HOME}/Projects/app/node_modules/@openai/codex/vendor/bin/codex": False,
     }
     failed = False
     for command, expect in samples.items():
